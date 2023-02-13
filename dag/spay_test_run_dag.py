@@ -14,6 +14,7 @@ from datetime import  datetime
 import psycopg2
 import psycopg2.extras as extras
 from sqlalchemy import create_engine
+import sqlalchemy as sa
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 captcha_key = '8ef519fed5b6f4b6126701606523f885'
@@ -237,8 +238,8 @@ def load_to_postgres(username,bank_account_id,latest_ref_code):
          #todo set today
         # if transaction_date != "10/12/2022" or ref_code == latest_ref_code:
         #     break
-        if ref_code == latest_ref_code:
-                break
+        # if ref_code == latest_ref_code:
+        #         break
 
 
         description =  row[4]
@@ -260,28 +261,82 @@ def load_to_postgres(username,bank_account_id,latest_ref_code):
         all_data_df = pd.DataFrame(new_row)
         data_df = pd.concat([data_df, all_data_df])
 
-      data_df['bank_account_id'] = bank_account_id  
+        data_df['bank_account_id'] = bank_account_id  
+        data_df['ref_code_hash'] = data_df['ref_code']
+        data_df['bank_description_hash'] = data_df['description']
+        
+
       save_data_db(data_df, latest_ref_code_new, bank_account_id) 
 
 
 def save_data_db(df, latest_ref_code_new, bank_account_id):
     engine = create_engine("postgresql://postgres:tiger@localhost/spaydb")
     if len(df) > 0:  
-        df.to_sql(name='vcb_{bank_account_id}_temp_table'.format(bank_account_id=bank_account_id), con=engine, if_exists='replace')
-        with engine.begin() as cn:
-            sql = """
-                INSERT INTO bank_account_statement(transaction_date, description, ref_code, amount, bank_account_id)
-                SELECT t.transaction_date, t.description, t.ref_code, t.amount, t.bank_account_id
-                FROM vcb_{bank_account_id}_temp_table t
-                WHERE NOT EXISTS
-                    (SELECT 1 FROM bank_account_statement f
-                        WHERE t.ref_code = f.ref_code
-                        AND t.bank_account_id = f.bank_account_id);
-                DROP TABLE vcb_{bank_account_id}_temp_table
-                """.format(bank_account_id=bank_account_id)
-            cn.execute(sql)
+        upsert(df, "bank_account_statement", engine, match_columns=["bank_account_id", "ref_code_hash", "bank_description_hash"])
+        # df.to_sql(name='vcb_{bank_account_id}_temp_table'.format(bank_account_id=bank_account_id), con=engine, if_exists='replace')
+        # with engine.begin() as cn:
+        #     sql = """
+        #         INSERT INTO bank_account_statement(transaction_date, description, ref_code, amount, bank_account_id)
+        #         SELECT t.transaction_date, t.description, t.ref_code, t.amount, t.bank_account_id
+        #         FROM vcb_{bank_account_id}_temp_table t
+        #         WHERE NOT EXISTS
+        #             (SELECT 1 FROM bank_account_statement f
+        #                 WHERE t.ref_code = f.ref_code
+        #                 AND t.bank_account_id = f.bank_account_id);
+        #         DROP TABLE vcb_{bank_account_id}_temp_table
+        #         """.format(bank_account_id=bank_account_id)
+        #     cn.execute(sql)
 
         update_bank_account(latest_ref_code_new, bank_account_id, normal_status)
+
+def upsert(data_frame, table_name, engine, schema=None, match_columns=None):
+    """
+    Perform an "upsert" on a PostgreSQL table from a DataFrame.
+    Constructs an INSERT … ON CONFLICT statement, uploads the DataFrame to a
+    temporary table, and then executes the INSERT.
+    Parameters
+    ----------
+    data_frame : pandas.DataFrame
+        The DataFrame to be upserted.
+    table_name : str
+        The name of the target table.
+    engine : sqlalchemy.engine.Engine
+        The SQLAlchemy Engine to use.
+    schema : str, optional
+        The name of the schema containing the target table.
+    match_columns : list of str, optional
+        A list of the column name(s) on which to match. If omitted, the
+        primary key columns of the target table will be used.
+    """
+    table_spec = ""
+    if schema:
+        table_spec += '"' + schema.replace('"', '""') + '".'
+    table_spec += '"' + table_name.replace('"', '""') + '"'
+
+    df_columns = list(data_frame.columns)
+    if not match_columns:
+        insp = sa.inspect(engine)
+        match_columns = insp.get_pk_constraint(table_name, schema=schema)[
+            "constrained_columns"
+        ]
+    columns_to_update = [col for col in df_columns if col not in match_columns]
+    insert_col_list = ", ".join([f'"{col_name}"' for col_name in df_columns])
+    stmt = f"INSERT INTO {table_spec} ({insert_col_list})\n"
+    stmt += f"SELECT {insert_col_list} FROM temp_table\n"
+    match_col_list = ", ".join([f'"{col}"' for col in match_columns])
+    stmt += f"ON CONFLICT ({match_col_list}) DO UPDATE SET\n"
+    stmt += ", ".join(
+        [f'"{col}" = EXCLUDED."{col}"' for col in columns_to_update]
+    )
+    print(stmt)
+
+    # with engine.begin() as conn:
+    #     conn.exec_driver_sql("DROP TABLE IF EXISTS temp_table")
+    #     conn.exec_driver_sql(
+    #         f"CREATE TEMPORARY TABLE temp_table AS SELECT * FROM {table_spec} WHERE false"
+    #     )
+    #     data_frame.to_sql("temp_table", conn, if_exists="append", index=False)
+    #     conn.exec_driver_sql(stmt)
 
 
 def update_bank_account(latest_ref_code_new, bank_account_id, status):
